@@ -55,13 +55,16 @@ function buildHpOrderXml(order) {
   const shipping = order.shipping_address || order.billing_address || {};
   const items = (order.line_items || []).filter(li => li.sku);
 
+  // Allow test override from the order note: e.g., "HPREF: TEST1002"
+  const forcedRef = /\bHPREF:\s*([A-Z0-9#-]+)/i.exec(order.note || '')?.[1] || null;
+  const reference = (forcedRef || String(order.name || order.id).replace(/^#/, '').toUpperCase());
+
   const xmlObj = {
     HPEnvelope: {
       account: process.env.HP_ACCOUNT,
       password: process.env.HP_TOKEN,
       order: {
-        // HP prefers references without the leading '#'
-        reference: String(order.name || order.id).replace(/^#/, '').toUpperCase(),
+        reference,
         shipby: shipCodeFor(order),
         date: new Date(order.created_at || Date.now()).toISOString().slice(0, 10),
         items: {
