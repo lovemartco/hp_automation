@@ -99,17 +99,7 @@ function parseHpXmlToObject(xmlString) {
 }
 
 // --- Honey's Place calls (always POST with form field "xmldata") ---
-async function hpPost(xmlBody) {
-  const res = await axios.post(
-    'https://www.honeysplace.com/ws/',
-    new URLSearchParams({ xmldata: xmlBody }).toString(),
-    {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      timeout: 20000
-    }
-  );
-  return res.data;
-}
+hpPost(xmlBody)
 
 // Submit order; return { code, reference } or undefined
 async function submitToHoney(xmlBody) {
