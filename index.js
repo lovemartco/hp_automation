@@ -96,7 +96,8 @@ function parseHpXmlToObject(xmlString) {
   }
 }
 
-// --- Honey's Place HTTP helpers (always form POST with xmldata=...) ---
+// --- Honey's Place HTTP helpers ---
+// Submit (POST with form xmldata=...) — matches HP docs and your successful tests
 async function hpPost(xmlBody) {
   const body = 'xmldata=' + encodeURIComponent(xmlBody);
   const res = await axios.post(
@@ -109,8 +110,8 @@ async function hpPost(xmlBody) {
         'User-Agent': 'lovemart-hp-automation/1.0 (+https://lovemartco.com)'
       },
       timeout: 20000,
-      maxRedirects: 0,            // avoid odd redirects that can 403
-      validateStatus: () => true  // let caller inspect non-200 responses
+      maxRedirects: 0,
+      validateStatus: () => true
     }
   );
 
@@ -130,7 +131,7 @@ async function submitToHoney(xmlBody) {
   return env ? { code: env.code ?? null, reference: env.reference ?? null, raw: data } : undefined;
 }
 
-// Query order status; returns parsed envelope (or {})
+// Status check (GET with ?xmldata=...) — helps avoid HP WAF 403s
 async function hpOrderStatus(reference) {
   const queryXml = create({
     HPEnvelope: {
@@ -140,8 +141,28 @@ async function hpOrderStatus(reference) {
     }
   }).end({ prettyPrint: false, declaration: { encoding: 'UTF-8' } });
 
-  const data = await hpPost(queryXml);
-  const obj = parseHpXmlToObject(data);
+  const res = await axios.get('https://www.honeysplace.com/ws/', {
+    params: { xmldata: queryXml },
+    headers: {
+      'Accept': 'text/xml,application/xml;q=0.9,*/*;q=0.8',
+      'User-Agent': 'curl/8.5.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': 'https://www.honeysplace.com/',
+      'Origin': 'https://www.honeysplace.com'
+    },
+    timeout: 20000,
+    maxRedirects: 0,
+    validateStatus: () => true
+  });
+
+  if (res.status !== 200) {
+    const snippet = typeof res.data === 'string' ? res.data.slice(0, 300) : JSON.stringify(res.data).slice(0, 300);
+    const err = new Error(`HP GET failed with status ${res.status}: ${snippet}`);
+    err.response = res;
+    throw err;
+  }
+
+  const obj = parseHpXmlToObject(res.data);
   return obj?.HPEnvelope || {};
 }
 
@@ -212,7 +233,8 @@ async function pollHpStatuses() {
       }
     } catch (err) {
       const status = err.response?.status;
-      const snippet = err.response?.data ? String(err.response.data).slice(0, 300) : '';
+      const snippetRaw = err.response?.data;
+      const snippet = typeof snippetRaw === 'string' ? snippetRaw.slice(0, 300) : JSON.stringify(snippetRaw || '').slice(0, 300);
       log('Polling error for', shopifyOrderId, '-', status || err.message, snippet);
     }
   }
