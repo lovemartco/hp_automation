@@ -1,11 +1,11 @@
-// index.js — LoveMart → Honey's Place automation
-// -----------------------------------------------
-// Requirements: express, crypto, raw-body, axios, xmlbuilder2, dotenv
-// Env vars: SHOPIFY_WEBHOOK_SECRET, SHOPIFY_STORE_DOMAIN, SHOPIFY_ADMIN_TOKEN,
-//           HP_ACCOUNT, HP_TOKEN, HP_DEFAULT_SHIP (optional),
-//           POLL_INTERVAL_MINUTES (optional), PORT (optional)
+// index.js — LoveMart → Honey's Place automation (Render)
+// -------------------------------------------------------
+// Env vars required:
+// SHOPIFY_WEBHOOK_SECRET, SHOPIFY_STORE_DOMAIN, SHOPIFY_ADMIN_TOKEN,
+// HP_ACCOUNT, HP_TOKEN
+// Optional: HP_DEFAULT_SHIP (default RTSHOP), POLL_INTERVAL_MINUTES (default 15), PORT (default 3000)
 
-// ------- TLS workaround for Honey's Place (legacy certificate) -------
+// ---- TLS workaround for Honey's Place (legacy certificate chain) ----
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 import express from 'express';
@@ -22,7 +22,7 @@ const app = express();
 // In-memory map: shopifyOrderId -> { reference, fulfilled }
 const orderStore = Object.create(null);
 
-// ---------- Helpers ----------
+// ---------- Small utilities ----------
 function log(...args) {
   console.log(new Date().toISOString(), '-', ...args);
 }
@@ -31,7 +31,6 @@ async function verifyShopifyHmac(req, rawBody) {
   const secret = process.env.SHOPIFY_WEBHOOK_SECRET || '';
   const header = req.get('X-Shopify-Hmac-Sha256') || '';
   const digest = crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
-
   const a = Buffer.from(header, 'utf8');
   const b = Buffer.from(digest, 'utf8');
   if (a.length !== b.length) return false;
@@ -90,7 +89,6 @@ function buildHpOrderXml(order) {
 
 function parseHpXmlToObject(xmlString) {
   try {
-    // xmlbuilder2 can parse strings as well:
     const doc = create(xmlString);
     return doc.end({ format: 'object' });
   } catch {
@@ -98,10 +96,33 @@ function parseHpXmlToObject(xmlString) {
   }
 }
 
-// --- Honey's Place calls (always POST with form field "xmldata") ---
-hpPost(xmlBody)
+// --- Honey's Place HTTP helpers (always form POST with xmldata=...) ---
+async function hpPost(xmlBody) {
+  const body = 'xmldata=' + encodeURIComponent(xmlBody);
+  const res = await axios.post(
+    'https://www.honeysplace.com/ws/',
+    body,
+    {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'text/xml,application/xml;q=0.9,*/*;q=0.8',
+        'User-Agent': 'lovemart-hp-automation/1.0 (+https://lovemartco.com)'
+      },
+      timeout: 20000,
+      maxRedirects: 0,            // avoid odd redirects that can 403
+      validateStatus: () => true  // let caller inspect non-200 responses
+    }
+  );
 
-// Submit order; return { code, reference } or undefined
+  if (res.status !== 200) {
+    const err = new Error(`HP POST failed with status ${res.status}`);
+    err.response = res;
+    throw err;
+  }
+  return res.data;
+}
+
+// Submit order; return { code, reference, raw } or undefined
 async function submitToHoney(xmlBody) {
   const data = await hpPost(xmlBody);
   const obj = parseHpXmlToObject(data);
@@ -109,7 +130,7 @@ async function submitToHoney(xmlBody) {
   return env ? { code: env.code ?? null, reference: env.reference ?? null, raw: data } : undefined;
 }
 
-// Query status; return object { status, trackingnumber1, shipagent, ... }
+// Query order status; returns parsed envelope (or {})
 async function hpOrderStatus(reference) {
   const queryXml = create({
     HPEnvelope: {
@@ -187,19 +208,21 @@ async function pollHpStatuses() {
         info.fulfilled = true;
         log(`Order ${shopifyOrderId} fulfilled. Tracking: ${tracking} (${carrier})`);
       } else {
-        log(`Order ${shopifyOrderId} still ${status || 'pending'}`);
+        log(`Order ${shopifyOrderId} still ${status || 'not yet shipped'}`);
       }
     } catch (err) {
-      log('Polling error for', shopifyOrderId, '-', err?.message || err);
+      const status = err.response?.status;
+      const snippet = err.response?.data ? String(err.response.data).slice(0, 300) : '';
+      log('Polling error for', shopifyOrderId, '-', status || err.message, snippet);
     }
   }
 }
 
 // ----- Routes -----
-// Health
+// Healthcheck
 app.get('/', (_req, res) => res.send("Honey's Place Automation running"));
 
-// Shopify webhook: order payment (recommended) or order creation
+// Shopify webhook: order payment (recommended)
 app.post('/webhooks/shopify/orders-paid', async (req, res) => {
   try {
     const rawBody = await getRawBody(req);
@@ -229,7 +252,9 @@ app.post('/webhooks/shopify/orders-paid', async (req, res) => {
       }
       return res.sendStatus(200);
     } catch (err) {
-      log('Error submitting to HP:', err?.message || err);
+      const status = err.response?.status;
+      const snippet = err.response?.data ? String(err.response.data).slice(0, 300) : '';
+      log('Error submitting to HP:', status || err.message, snippet);
       return res.sendStatus(500);
     }
   } catch (err) {
@@ -247,7 +272,7 @@ setInterval(() => {
   pollHpStatuses().catch(e => log('Polling error (interval):', e?.message || e));
 }, intervalMinutes * 60 * 1000);
 
-// Optional: first poll a bit later to catch freshly submitted test orders
+// Optional: first poll shortly after boot to catch fresh orders
 setTimeout(() => {
   pollHpStatuses().catch(e => log('Initial poll error:', e?.message || e));
 }, 30 * 1000);
