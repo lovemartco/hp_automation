@@ -40,6 +40,7 @@ async function verifyShopifyHmac(req, rawBody) {
 function shipCodeFor(order) {
   const title = (order.shipping_lines?.[0]?.title || '').toLowerCase().trim();
   const map = {
+    'standard': 'P009',
     'usps priority': 'P002',
     'priority mail': 'P002',
     'fedex ground': 'F006',
