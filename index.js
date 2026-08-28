@@ -105,7 +105,7 @@ async function markSupplierOrderSubmitted(
   );
 }
 
-async function markSupplierSubmissionError(
+async function markSupplierSubmissionRejected(
   shopifyOrderId,
   errorMessage
 ) {
@@ -113,7 +113,7 @@ async function markSupplierSubmissionError(
     `
       UPDATE supplier_orders
       SET
-        hp_status = 'submission_error',
+        hp_status = 'submission_rejected',
         last_error = $2,
         retry_count = retry_count + 1,
         updated_at = NOW()
@@ -121,7 +121,55 @@ async function markSupplierSubmissionError(
     `,
     [
       String(shopifyOrderId),
-      String(errorMessage || 'Unknown HP submission error').slice(0, 1000)
+      String(
+        errorMessage ||
+        'Honey\\'s Place rejected the order submission.'
+      ).slice(0, 1000)
+    ]
+  );
+}
+
+async function markSupplierSubmissionUnknown(
+  shopifyOrderId,
+  errorMessage
+) {
+  await db.query(
+    `
+      UPDATE supplier_orders
+      SET
+        hp_status = 'submission_unknown',
+        last_error = $2,
+        retry_count = retry_count + 1,
+        updated_at = NOW()
+      WHERE shopify_order_id = $1
+    `,
+    [
+      String(shopifyOrderId),
+      String(
+        errorMessage ||
+        'HP submission result is unknown.'
+      ).slice(0, 1000)
+    ]
+  );
+}
+
+async function recordUnconfirmedReferencePoll(
+  shopifyOrderId,
+  message
+) {
+  await db.query(
+    `
+      UPDATE supplier_orders
+      SET
+        hp_status = 'submission_unknown',
+        last_error = $2,
+        last_polled_at = NOW(),
+        updated_at = NOW()
+      WHERE shopify_order_id = $1
+    `,
+    [
+      String(shopifyOrderId),
+      String(message).slice(0, 1000)
     ]
   );
 }
@@ -138,11 +186,25 @@ async function getPendingSupplierOrders() {
         carrier,
         last_polled_at,
         last_error,
-        retry_count
+        retry_count,
+        created_at,
+        updated_at
       FROM supplier_orders
       WHERE
         fulfilled = false
         AND hp_reference IS NOT NULL
+
+        -- Confirmed HP rejections require manual review.
+        -- Do not continuously poll them.
+        AND hp_status <> 'submission_rejected'
+
+        -- Do not poll a brand-new reservation while the
+        -- webhook may still be actively submitting it.
+        AND (
+          hp_status <> 'reserved'
+          OR updated_at < NOW() - INTERVAL '2 minutes'
+        )
+
       ORDER BY created_at ASC
     `
   );
@@ -270,7 +332,7 @@ function shipCodeFor(order) {
 }
 
 // -------------------------------------------------------
-// HP reference
+// Honey's Place reference
 // -------------------------------------------------------
 
 function hpReferenceFor(order) {
@@ -435,7 +497,8 @@ async function hpPost(xmlBody) {
         `HP POST failed with status ${res.status}`
       );
 
-    err.response = res;
+    err.response =
+      res;
 
     throw err;
   }
@@ -468,7 +531,7 @@ async function submitToHoney(xmlBody) {
 }
 
 // -------------------------------------------------------
-// HP order status
+// Honey's Place status lookup
 // -------------------------------------------------------
 
 async function hpOrderStatus(reference) {
@@ -556,6 +619,39 @@ async function hpOrderStatus(reference) {
   return (
     obj?.HPEnvelope ||
     {}
+  );
+}
+
+// -------------------------------------------------------
+// Determine whether HP recognizes an order reference
+// -------------------------------------------------------
+
+function hpStatusIndicatesKnownOrder(statusObj) {
+  const status =
+    String(
+      statusObj?.status || ''
+    ).trim();
+
+  const salesOrder =
+    String(
+      statusObj?.salesorder || ''
+    ).trim();
+
+  const orderDate =
+    String(
+      statusObj?.orderdate || ''
+    ).trim();
+
+  const tracking =
+    String(
+      statusObj?.trackingnumber1 || ''
+    ).trim();
+
+  return Boolean(
+    status ||
+    salesOrder ||
+    orderDate ||
+    tracking
   );
 }
 
@@ -664,9 +760,12 @@ async function createShopifyFulfillment(
 
       tracking_info: {
         number,
+
         company:
           carrier || '',
-        url: ''
+
+        url:
+          ''
       },
 
       line_items_by_fulfillment_order:
@@ -726,34 +825,95 @@ async function pollHpStatuses() {
         info.hp_reference
       );
 
+    const existingState =
+      String(
+        info.hp_status || ''
+      );
+
     try {
       const statusObj =
         await hpOrderStatus(
           hpReference
         );
 
-      const status =
+      const knownOrder =
+        hpStatusIndicatesKnownOrder(
+          statusObj
+        );
+
+      // For an uncertain submission or a stale
+      // reservation, first determine whether HP
+      // actually recognizes the reference.
+      if (
         (
-          statusObj.status ||
-          ''
+          existingState ===
+            'submission_unknown' ||
+          existingState ===
+            'reserved'
+        ) &&
+        !knownOrder
+      ) {
+        await recordUnconfirmedReferencePoll(
+          shopifyOrderId,
+          `HP reference ${hpReference} has not yet been confirmed by Honey's Place.`
+        );
+
+        log(
+          `Order ${shopifyOrderId} submission remains unknown; HP reference ${hpReference} is not yet confirmed`
+        );
+
+        continue;
+      }
+
+      // If an uncertain/stale reservation is now
+      // recognized by HP, the supplier received it.
+      if (
+        (
+          existingState ===
+            'submission_unknown' ||
+          existingState ===
+            'reserved'
+        ) &&
+        knownOrder
+      ) {
+        await markSupplierOrderSubmitted(
+          shopifyOrderId,
+          hpReference
+        );
+
+        log(
+          `Order ${shopifyOrderId} confirmed at HP after reconciliation`
+        );
+      }
+
+      const status =
+        String(
+          statusObj.status || ''
         )
           .toLowerCase()
           .trim();
 
       const tracking =
-        statusObj.trackingnumber1 ||
-        '';
+        String(
+          statusObj.trackingnumber1 ||
+          ''
+        ).trim();
 
       const carrier =
-        statusObj.shipagent ||
-        '';
+        String(
+          statusObj.shipagent ||
+          ''
+        ).trim();
 
       await updateSupplierPollStatus(
         shopifyOrderId,
         {
+          // If HP has not supplied a status but
+          // recognizes the order, preserve the
+          // submitted state.
           hpStatus:
             status ||
-            null,
+            'submitted',
 
           trackingNumber:
             tracking ||
@@ -827,7 +987,7 @@ async function pollHpStatuses() {
         }
       } else {
         log(
-          `Order ${shopifyOrderId} still ${status || 'not yet shipped'}`
+          `Order ${shopifyOrderId} still ${status || 'submitted / awaiting HP status'}`
         );
       }
     } catch (err) {
@@ -947,11 +1107,7 @@ app.post(
         order.line_items ||
         [];
 
-      // Do not send a partial supplier order.
-      //
-      // Every Shopify line item must have a SKU.
-      // Otherwise HP could receive only part of
-      // the customer's order.
+      // Never silently create a partial HP order.
       const allItemsHaveSku =
         lineItems.length > 0 &&
         lineItems.every(
@@ -973,19 +1129,14 @@ app.post(
         );
       }
 
-      // Determine the exact HP reference before
-      // contacting Honey's Place.
       const expectedHpReference =
         hpReferenceFor(
           order
         );
 
-      // ATOMIC ORDER RESERVATION
-      //
-      // PostgreSQL's UNIQUE constraint on
-      // shopify_order_id guarantees that only
-      // one webhook request can successfully
-      // reserve this Shopify order.
+      // Atomic reservation.
+      // Only one webhook request can reserve
+      // a given Shopify order.
       const reservationCreated =
         await reserveSupplierOrder(
           order.id,
@@ -1021,12 +1172,14 @@ app.post(
             xml
           );
 
+        // HP responded successfully at the HTTP level,
+        // but explicitly did NOT accept the order.
         if (
           !result ||
           result.code !==
             '100'
         ) {
-          const errorMessage =
+          const rejectionMessage =
             result?.raw
               ? String(
                   result.raw
@@ -1036,19 +1189,21 @@ app.post(
                 )
               : 'Honey\'s Place returned an invalid or unsuccessful order response.';
 
-          await markSupplierSubmissionError(
+          await markSupplierSubmissionRejected(
             order.id,
-            errorMessage
+            rejectionMessage
           );
 
           log(
-            'HP submission failed for',
+            'HP REJECTED order',
             order.id,
             'response:',
             result?.raw ||
               result
           );
 
+          // Confirmed rejection should not cause
+          // Shopify to repeatedly resend the webhook.
           return res.sendStatus(
             200
           );
@@ -1074,6 +1229,10 @@ app.post(
           200
         );
       } catch (err) {
+        // A timeout, connection failure, non-200 HTTP
+        // response, etc. does NOT prove HP rejected
+        // the order. HP may have received it before
+        // our connection failed.
         const status =
           err.response?.status;
 
@@ -1100,13 +1259,13 @@ app.post(
             .slice(0, 1000);
 
         try {
-          await markSupplierSubmissionError(
+          await markSupplierSubmissionUnknown(
             order.id,
             errorMessage
           );
         } catch (dbErr) {
           log(
-            'Database error while recording HP submission failure for',
+            'Database error while recording unknown HP submission result for',
             order.id,
             '-',
             dbErr?.message ||
@@ -1115,15 +1274,15 @@ app.post(
         }
 
         log(
-          'Error submitting to HP:',
+          'HP submission result UNKNOWN for order',
+          order.id,
+          '-',
           errorMessage
         );
 
-        // Returning 500 allows Shopify to retry
-        // delivery of the webhook.
-        //
-        // The atomic database reservation prevents
-        // that retry from creating a duplicate HP order.
+        // Shopify may retry the webhook.
+        // Atomic reservation prevents that retry
+        // from creating a duplicate HP order.
         return res.sendStatus(
           500
         );
