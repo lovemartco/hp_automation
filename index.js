@@ -123,7 +123,7 @@ async function markSupplierSubmissionRejected(
       String(shopifyOrderId),
       String(
         errorMessage ||
-        'Honey\\'s Place rejected the order submission.'
+        "Honey's Place rejected the order submission."
       ).slice(0, 1000)
     ]
   );
