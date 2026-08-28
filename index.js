@@ -38,30 +38,20 @@ db.on('error', err => {
 
 const app = express();
 
-// ---------- Small utilities ----------
+// -------------------------------------------------------
+// Logging
+// -------------------------------------------------------
 
 function log(...args) {
   console.log(new Date().toISOString(), '-', ...args);
 }
 
-// ---------- PostgreSQL helpers ----------
+// -------------------------------------------------------
+// PostgreSQL helpers
+// -------------------------------------------------------
 
-async function supplierOrderExists(shopifyOrderId) {
+async function reserveSupplierOrder(shopifyOrderId, hpReference) {
   const result = await db.query(
-    `
-      SELECT 1
-      FROM supplier_orders
-      WHERE shopify_order_id = $1
-      LIMIT 1
-    `,
-    [String(shopifyOrderId)]
-  );
-
-  return result.rowCount > 0;
-}
-
-async function saveSupplierOrder(shopifyOrderId, hpReference) {
-  await db.query(
     `
       INSERT INTO supplier_orders (
         shopify_order_id,
@@ -72,13 +62,67 @@ async function saveSupplierOrder(shopifyOrderId, hpReference) {
         created_at,
         updated_at
       )
-      VALUES ($1, $2, 'submitted', false, 0, NOW(), NOW())
+      VALUES (
+        $1,
+        $2,
+        'reserved',
+        false,
+        0,
+        NOW(),
+        NOW()
+      )
       ON CONFLICT (shopify_order_id)
-      DO UPDATE SET
-        hp_reference = EXCLUDED.hp_reference,
-        updated_at = NOW()
+      DO NOTHING
+      RETURNING shopify_order_id
     `,
-    [String(shopifyOrderId), String(hpReference)]
+    [
+      String(shopifyOrderId),
+      String(hpReference)
+    ]
+  );
+
+  return result.rowCount === 1;
+}
+
+async function markSupplierOrderSubmitted(
+  shopifyOrderId,
+  hpReference
+) {
+  await db.query(
+    `
+      UPDATE supplier_orders
+      SET
+        hp_reference = $2,
+        hp_status = 'submitted',
+        last_error = NULL,
+        updated_at = NOW()
+      WHERE shopify_order_id = $1
+    `,
+    [
+      String(shopifyOrderId),
+      String(hpReference)
+    ]
+  );
+}
+
+async function markSupplierSubmissionError(
+  shopifyOrderId,
+  errorMessage
+) {
+  await db.query(
+    `
+      UPDATE supplier_orders
+      SET
+        hp_status = 'submission_error',
+        last_error = $2,
+        retry_count = retry_count + 1,
+        updated_at = NOW()
+      WHERE shopify_order_id = $1
+    `,
+    [
+      String(shopifyOrderId),
+      String(errorMessage || 'Unknown HP submission error').slice(0, 1000)
+    ]
   );
 }
 
@@ -96,7 +140,9 @@ async function getPendingSupplierOrders() {
         last_error,
         retry_count
       FROM supplier_orders
-      WHERE fulfilled = false
+      WHERE
+        fulfilled = false
+        AND hp_reference IS NOT NULL
       ORDER BY created_at ASC
     `
   );
@@ -167,11 +213,16 @@ async function markSupplierOrderFulfilled(
   );
 }
 
-// ---------- Shopify webhook verification ----------
+// -------------------------------------------------------
+// Shopify webhook verification
+// -------------------------------------------------------
 
 async function verifyShopifyHmac(req, rawBody) {
-  const secret = process.env.SHOPIFY_WEBHOOK_SECRET || '';
-  const header = req.get('X-Shopify-Hmac-Sha256') || '';
+  const secret =
+    process.env.SHOPIFY_WEBHOOK_SECRET || '';
+
+  const header =
+    req.get('X-Shopify-Hmac-Sha256') || '';
 
   const digest = crypto
     .createHmac('sha256', secret)
@@ -188,14 +239,18 @@ async function verifyShopifyHmac(req, rawBody) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// ---------- Shipping mapping ----------
+// -------------------------------------------------------
+// Shipping mapping
+// -------------------------------------------------------
 
 function shipCodeFor(order) {
-  const title = (
-    order.shipping_lines?.[0]?.title || ''
-  )
-    .toLowerCase()
-    .trim();
+  const title =
+    (
+      order.shipping_lines?.[0]?.title ||
+      ''
+    )
+      .toLowerCase()
+      .trim();
 
   const map = {
     'standard': 'P009',
@@ -214,7 +269,27 @@ function shipCodeFor(order) {
   );
 }
 
-// ---------- Honey's Place XML ----------
+// -------------------------------------------------------
+// HP reference
+// -------------------------------------------------------
+
+function hpReferenceFor(order) {
+  const forcedRef =
+    /\bHPREF:\s*([A-Z0-9#-]+)/i.exec(
+      order.note || ''
+    )?.[1] || null;
+
+  return (
+    forcedRef ||
+    String(order.name || order.id)
+      .replace(/^#/, '')
+      .toUpperCase()
+  );
+}
+
+// -------------------------------------------------------
+// Honey's Place XML
+// -------------------------------------------------------
 
 function buildHpOrderXml(order) {
   const shipping =
@@ -222,56 +297,62 @@ function buildHpOrderXml(order) {
     order.billing_address ||
     {};
 
-  const items = (order.line_items || []).filter(
-    li => li.sku
-  );
-
-  // Allow test override from order note:
-  // Example: "HPREF: TEST1002"
-  const forcedRef =
-    /\bHPREF:\s*([A-Z0-9#-]+)/i.exec(
-      order.note || ''
-    )?.[1] || null;
+  const items =
+    (order.line_items || [])
+      .filter(li => li.sku);
 
   const reference =
-    forcedRef ||
-    String(order.name || order.id)
-      .replace(/^#/, '')
-      .toUpperCase();
+    hpReferenceFor(order);
 
   const xmlObj = {
     HPEnvelope: {
       account: process.env.HP_ACCOUNT,
       password: process.env.HP_TOKEN,
+
       order: {
         reference,
-        shipby: shipCodeFor(order),
 
-        date: new Date(
-          order.created_at || Date.now()
-        )
-          .toISOString()
-          .slice(0, 10),
+        shipby:
+          shipCodeFor(order),
+
+        date:
+          new Date(
+            order.created_at ||
+            Date.now()
+          )
+            .toISOString()
+            .slice(0, 10),
 
         items: {
-          item: items.map(li => ({
-            sku: li.sku,
-            qty: li.quantity
-          }))
+          item:
+            items.map(li => ({
+              sku: li.sku,
+              qty: li.quantity
+            }))
         },
 
-        last: shipping.last_name || '',
-        first: shipping.first_name || '',
-        address1: shipping.address1 || '',
-        address2: shipping.address2 || '',
-        city: shipping.city || '',
+        last:
+          shipping.last_name || '',
+
+        first:
+          shipping.first_name || '',
+
+        address1:
+          shipping.address1 || '',
+
+        address2:
+          shipping.address2 || '',
+
+        city:
+          shipping.city || '',
 
         state:
           shipping.province_code ||
           shipping.province ||
           '',
 
-        zip: shipping.zip || '',
+        zip:
+          shipping.zip || '',
 
         country:
           shipping.country_code ||
@@ -283,11 +364,13 @@ function buildHpOrderXml(order) {
           order.phone ||
           '',
 
-        emailaddress: order.email || '',
+        emailaddress:
+          order.email || '',
 
-        instructions: (
-          order.note || ''
-        ).substring(0, 250)
+        instructions:
+          (
+            order.note || ''
+          ).substring(0, 250)
       }
     }
   };
@@ -302,7 +385,8 @@ function buildHpOrderXml(order) {
 
 function parseHpXmlToObject(xmlString) {
   try {
-    const doc = create(xmlString);
+    const doc =
+      create(xmlString);
 
     return doc.end({
       format: 'object'
@@ -312,41 +396,44 @@ function parseHpXmlToObject(xmlString) {
   }
 }
 
-// ---------- Honey's Place HTTP helpers ----------
+// -------------------------------------------------------
+// Honey's Place HTTP helpers
+// -------------------------------------------------------
 
-// Submit HP order using POST:
-// xmldata=<URL encoded XML>
 async function hpPost(xmlBody) {
   const body =
     'xmldata=' +
     encodeURIComponent(xmlBody);
 
-  const res = await axios.post(
-    'https://www.honeysplace.com/ws/',
-    body,
-    {
-      headers: {
-        'Content-Type':
-          'application/x-www-form-urlencoded',
+  const res =
+    await axios.post(
+      'https://www.honeysplace.com/ws/',
+      body,
+      {
+        headers: {
+          'Content-Type':
+            'application/x-www-form-urlencoded',
 
-        'Accept':
-          'text/xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept':
+            'text/xml,application/xml;q=0.9,*/*;q=0.8',
 
-        'User-Agent':
-          'lovemart-hp-automation/1.0 (+https://lovemartco.com)'
-      },
+          'User-Agent':
+            'lovemart-hp-automation/1.0 (+https://lovemartco.com)'
+        },
 
-      timeout: 20000,
-      maxRedirects: 0,
+        timeout: 20000,
+        maxRedirects: 0,
 
-      validateStatus: () => true
-    }
-  );
+        validateStatus:
+          () => true
+      }
+    );
 
   if (res.status !== 200) {
-    const err = new Error(
-      `HP POST failed with status ${res.status}`
-    );
+    const err =
+      new Error(
+        `HP POST failed with status ${res.status}`
+      );
 
     err.response = res;
 
@@ -356,12 +443,9 @@ async function hpPost(xmlBody) {
   return res.data;
 }
 
-// Submit order.
-// Returns:
-// { code, reference, raw }
-// or undefined.
 async function submitToHoney(xmlBody) {
-  const data = await hpPost(xmlBody);
+  const data =
+    await hpPost(xmlBody);
 
   const obj =
     parseHpXmlToObject(data);
@@ -371,59 +455,79 @@ async function submitToHoney(xmlBody) {
 
   return env
     ? {
-        code: env.code ?? null,
-        reference: env.reference ?? null,
-        raw: data
+        code:
+          env.code ?? null,
+
+        reference:
+          env.reference ?? null,
+
+        raw:
+          data
       }
     : undefined;
 }
 
-// Check HP order status using GET.
-// Browser-like headers help avoid HP WAF 403 responses.
+// -------------------------------------------------------
+// HP order status
+// -------------------------------------------------------
+
 async function hpOrderStatus(reference) {
-  const queryXml = create({
-    HPEnvelope: {
-      account: process.env.HP_ACCOUNT,
-      password: process.env.HP_TOKEN,
-      orderstatus: String(reference)
-    }
-  }).end({
-    prettyPrint: false,
-    declaration: {
-      encoding: 'UTF-8'
-    }
-  });
+  const queryXml =
+    create({
+      HPEnvelope: {
+        account:
+          process.env.HP_ACCOUNT,
 
-  const res = await axios.get(
-    'https://www.honeysplace.com/ws/',
-    {
-      params: {
-        xmldata: queryXml
-      },
+        password:
+          process.env.HP_TOKEN,
 
-      headers: {
-        'Accept':
-          'text/xml,application/xml;q=0.9,*/*;q=0.8',
+        orderstatus:
+          String(reference)
+      }
+    }).end({
+      prettyPrint: false,
 
-        'User-Agent':
-          'curl/8.5.0',
+      declaration: {
+        encoding: 'UTF-8'
+      }
+    });
 
-        'Accept-Language':
-          'en-US,en;q=0.9',
+  const res =
+    await axios.get(
+      'https://www.honeysplace.com/ws/',
+      {
+        params: {
+          xmldata:
+            queryXml
+        },
 
-        'Referer':
-          'https://www.honeysplace.com/',
+        headers: {
+          'Accept':
+            'text/xml,application/xml;q=0.9,*/*;q=0.8',
 
-        'Origin':
-          'https://www.honeysplace.com'
-      },
+          'User-Agent':
+            'curl/8.5.0',
 
-      timeout: 20000,
-      maxRedirects: 0,
+          'Accept-Language':
+            'en-US,en;q=0.9',
 
-      validateStatus: () => true
-    }
-  );
+          'Referer':
+            'https://www.honeysplace.com/',
+
+          'Origin':
+            'https://www.honeysplace.com'
+        },
+
+        timeout:
+          20000,
+
+        maxRedirects:
+          0,
+
+        validateStatus:
+          () => true
+      }
+    );
 
   if (res.status !== 200) {
     const snippet =
@@ -433,34 +537,47 @@ async function hpOrderStatus(reference) {
             res.data
           ).slice(0, 300);
 
-    const err = new Error(
-      `HP GET failed with status ${res.status}: ${snippet}`
-    );
+    const err =
+      new Error(
+        `HP GET failed with status ${res.status}: ${snippet}`
+      );
 
-    err.response = res;
+    err.response =
+      res;
 
     throw err;
   }
 
   const obj =
-    parseHpXmlToObject(res.data);
+    parseHpXmlToObject(
+      res.data
+    );
 
-  return obj?.HPEnvelope || {};
+  return (
+    obj?.HPEnvelope ||
+    {}
+  );
 }
 
-// ---------- Shopify fulfillment ----------
+// -------------------------------------------------------
+// Shopify fulfillment
+// -------------------------------------------------------
 
 async function createShopifyFulfillment(
   orderId,
-  { number, carrier }
+  {
+    number,
+    carrier
+  }
 ) {
   const shopDomain =
-    process.env.SHOPIFY_STORE_DOMAIN;
+    process.env
+      .SHOPIFY_STORE_DOMAIN;
 
   const adminToken =
-    process.env.SHOPIFY_ADMIN_TOKEN;
+    process.env
+      .SHOPIFY_ADMIN_TOKEN;
 
-  // 1) Get Shopify fulfillment orders.
   const listUrl =
     `https://${shopDomain}` +
     `/admin/api/2026-07/orders/` +
@@ -468,29 +585,31 @@ async function createShopifyFulfillment(
 
   const {
     data: listData
-  } = await axios.get(
-    listUrl,
-    {
-      headers: {
-        'X-Shopify-Access-Token':
-          adminToken
+  } =
+    await axios.get(
+      listUrl,
+      {
+        headers: {
+          'X-Shopify-Access-Token':
+            adminToken
+        }
       }
-    }
-  );
-
-  // Find an open fulfillment order Shopify says
-  // can actually be fulfilled.
-  const fOrder =
-    listData.fulfillment_orders?.find(
-      fo =>
-        fo.status === 'open' &&
-        (
-          fo.supported_actions ||
-          []
-        ).includes(
-          'create_fulfillment'
-        )
     );
+
+  const fOrder =
+    listData
+      .fulfillment_orders
+      ?.find(
+        fo =>
+          fo.status ===
+            'open' &&
+          (
+            fo.supported_actions ||
+            []
+          ).includes(
+            'create_fulfillment'
+          )
+      );
 
   if (!fOrder) {
     log(
@@ -502,18 +621,25 @@ async function createShopifyFulfillment(
   }
 
   const lineItems =
-    (fOrder.line_items || [])
+    (
+      fOrder.line_items ||
+      []
+    )
       .filter(
         li =>
           Number(
             li.fulfillable_quantity
           ) > 0
       )
-      .map(li => ({
-        id: li.id,
-        quantity:
-          li.fulfillable_quantity
-      }));
+      .map(
+        li => ({
+          id:
+            li.id,
+
+          quantity:
+            li.fulfillable_quantity
+        })
+      );
 
   if (!lineItems.length) {
     log(
@@ -524,7 +650,6 @@ async function createShopifyFulfillment(
     return false;
   }
 
-  // 2) Create Shopify fulfillment.
   const fulfillmentUrl =
     `https://${shopDomain}` +
     `/admin/api/2026-07/fulfillments.json`;
@@ -534,23 +659,26 @@ async function createShopifyFulfillment(
       message:
         "Fulfilled by Honey's Place",
 
-      notify_customer: true,
+      notify_customer:
+        true,
 
       tracking_info: {
         number,
-        company: carrier || '',
+        company:
+          carrier || '',
         url: ''
       },
 
-      line_items_by_fulfillment_order: [
-        {
-          fulfillment_order_id:
-            fOrder.id,
+      line_items_by_fulfillment_order:
+        [
+          {
+            fulfillment_order_id:
+              fOrder.id,
 
-          fulfillment_order_line_items:
-            lineItems
-        }
-      ]
+            fulfillment_order_line_items:
+              lineItems
+          }
+        ]
     }
   };
 
@@ -575,7 +703,9 @@ async function createShopifyFulfillment(
   return true;
 }
 
-// ---------- Poll Honey's Place statuses ----------
+// -------------------------------------------------------
+// Poll Honey's Place statuses
+// -------------------------------------------------------
 
 async function pollHpStatuses() {
   const entries =
@@ -618,7 +748,6 @@ async function pollHpStatuses() {
         statusObj.shipagent ||
         '';
 
-      // Record every successful HP poll.
       await updateSupplierPollStatus(
         shopifyOrderId,
         {
@@ -634,15 +763,15 @@ async function pollHpStatuses() {
             carrier ||
             null,
 
-          lastError: null,
+          lastError:
+            null,
 
-          incrementRetry: false
+          incrementRetry:
+            false
         }
       );
 
       if (status === 'shipped') {
-        // HP may mark an order shipped slightly before
-        // a tracking number becomes available.
         if (!tracking) {
           log(
             `Order ${shopifyOrderId} is shipped at HP but has no tracking number yet`
@@ -655,13 +784,13 @@ async function pollHpStatuses() {
           await createShopifyFulfillment(
             shopifyOrderId,
             {
-              number: tracking,
+              number:
+                tracking,
+
               carrier
             }
           );
 
-        // Only mark the database record fulfilled
-        // AFTER Shopify successfully creates fulfillment.
         if (created) {
           await markSupplierOrderFulfilled(
             shopifyOrderId,
@@ -676,7 +805,8 @@ async function pollHpStatuses() {
           await updateSupplierPollStatus(
             shopifyOrderId,
             {
-              hpStatus: status,
+              hpStatus:
+                status,
 
               trackingNumber:
                 tracking,
@@ -715,7 +845,8 @@ async function pollHpStatuses() {
               300
             )
           : JSON.stringify(
-              snippetRaw || ''
+              snippetRaw ||
+              ''
             ).slice(
               0,
               300
@@ -764,9 +895,10 @@ async function pollHpStatuses() {
   }
 }
 
-// ---------- Routes ----------
+// -------------------------------------------------------
+// Routes
+// -------------------------------------------------------
 
-// Healthcheck
 app.get(
   '/',
   (_req, res) =>
@@ -775,7 +907,10 @@ app.get(
     )
 );
 
-// Shopify webhook: paid order
+// -------------------------------------------------------
+// Shopify paid-order webhook
+// -------------------------------------------------------
+
 app.post(
   '/webhooks/shopify/orders-paid',
   async (req, res) => {
@@ -808,19 +943,28 @@ app.post(
           )
         );
 
-      // Guard:
-      // HP will reject an order with no SKUs.
-      const hasSku =
-        (
-          order.line_items ||
-          []
-        ).some(
-          li => !!li.sku
+      const lineItems =
+        order.line_items ||
+        [];
+
+      // Do not send a partial supplier order.
+      //
+      // Every Shopify line item must have a SKU.
+      // Otherwise HP could receive only part of
+      // the customer's order.
+      const allItemsHaveSku =
+        lineItems.length > 0 &&
+        lineItems.every(
+          li =>
+            typeof li.sku ===
+              'string' &&
+            li.sku.trim() !==
+              ''
         );
 
-      if (!hasSku) {
+      if (!allItemsHaveSku) {
         log(
-          'Skipping order with no SKUs',
+          'Skipping order because one or more line items are missing SKUs',
           order.id
         );
 
@@ -829,17 +973,26 @@ app.post(
         );
       }
 
-      // Duplicate webhook protection.
-      //
-      // If this Shopify order already exists in our
-      // supplier_orders database, do not submit it
-      // to Honey's Place a second time.
-      const alreadySubmitted =
-        await supplierOrderExists(
-          order.id
+      // Determine the exact HP reference before
+      // contacting Honey's Place.
+      const expectedHpReference =
+        hpReferenceFor(
+          order
         );
 
-      if (alreadySubmitted) {
+      // ATOMIC ORDER RESERVATION
+      //
+      // PostgreSQL's UNIQUE constraint on
+      // shopify_order_id guarantees that only
+      // one webhook request can successfully
+      // reserve this Shopify order.
+      const reservationCreated =
+        await reserveSupplierOrder(
+          order.id,
+          expectedHpReference
+        );
+
+      if (!reservationCreated) {
         log(
           'Skipping duplicate Shopify webhook for order',
           order.id
@@ -849,6 +1002,13 @@ app.post(
           200
         );
       }
+
+      log(
+        'Reserved Shopify order',
+        order.id,
+        'with HP reference',
+        expectedHpReference
+      );
 
       const xml =
         buildHpOrderXml(
@@ -866,6 +1026,21 @@ app.post(
           result.code !==
             '100'
         ) {
+          const errorMessage =
+            result?.raw
+              ? String(
+                  result.raw
+                ).slice(
+                  0,
+                  1000
+                )
+              : 'Honey\'s Place returned an invalid or unsuccessful order response.';
+
+          await markSupplierSubmissionError(
+            order.id,
+            errorMessage
+          );
+
           log(
             'HP submission failed for',
             order.id,
@@ -873,22 +1048,27 @@ app.post(
             result?.raw ||
               result
           );
-        } else {
-          // Persist the relationship between:
-          // Shopify order ID
-          // and Honey's Place reference.
-          await saveSupplierOrder(
-            order.id,
-            result.reference
-          );
 
-          log(
-            'Submitted order',
-            order.id,
-            'to HP with reference',
-            result.reference
+          return res.sendStatus(
+            200
           );
         }
+
+        const returnedReference =
+          result.reference ||
+          expectedHpReference;
+
+        await markSupplierOrderSubmitted(
+          order.id,
+          returnedReference
+        );
+
+        log(
+          'Submitted order',
+          order.id,
+          'to HP with reference',
+          returnedReference
+        );
 
         return res.sendStatus(
           200
@@ -900,21 +1080,50 @@ app.post(
         const snippet =
           err.response?.data
             ? String(
-                err.response
-                  .data
+                err.response.data
               ).slice(
                 0,
                 300
               )
             : '';
 
+        const errorMessage =
+          [
+            status ||
+              err?.message ||
+              'Unknown submission error',
+
+            snippet
+          ]
+            .filter(Boolean)
+            .join(' - ')
+            .slice(0, 1000);
+
+        try {
+          await markSupplierSubmissionError(
+            order.id,
+            errorMessage
+          );
+        } catch (dbErr) {
+          log(
+            'Database error while recording HP submission failure for',
+            order.id,
+            '-',
+            dbErr?.message ||
+              dbErr
+          );
+        }
+
         log(
           'Error submitting to HP:',
-          status ||
-            err.message,
-          snippet
+          errorMessage
         );
 
+        // Returning 500 allows Shopify to retry
+        // delivery of the webhook.
+        //
+        // The atomic database reservation prevents
+        // that retry from creating a duplicate HP order.
         return res.sendStatus(
           500
         );
@@ -933,7 +1142,9 @@ app.post(
   }
 );
 
-// ---------- Start server & poller ----------
+// -------------------------------------------------------
+// Start server
+// -------------------------------------------------------
 
 const port =
   Number(
@@ -948,8 +1159,6 @@ app.listen(
       `HP Automation listening on port ${port}`
     );
 
-    // Verify PostgreSQL connectivity every time
-    // a new Render instance starts.
     try {
       await db.query(
         'SELECT 1'
@@ -967,6 +1176,10 @@ app.listen(
     }
   }
 );
+
+// -------------------------------------------------------
+// Polling interval
+// -------------------------------------------------------
 
 const intervalMinutes =
   Math.max(
@@ -996,11 +1209,13 @@ setInterval(
     1000
 );
 
-// First poll shortly after boot.
+// -------------------------------------------------------
+// Initial post-start poll
+// -------------------------------------------------------
 //
-// Because pending orders now live in PostgreSQL,
-// this automatically resumes tracking after
-// a Render restart or redeployment.
+// Pending orders live in PostgreSQL, so every
+// Render restart automatically resumes polling.
+
 setTimeout(
   () => {
     pollHpStatuses().catch(
